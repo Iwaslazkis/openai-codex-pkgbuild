@@ -1,0 +1,1834 @@
+From 09ebc34f17b84c4ec7550960b2f9c090f5dde5b7 Mon Sep 17 00:00:00 2001
+From: Felipe Coury <felipe.coury@openai.com>
+Date: Tue, 21 Apr 2026 22:00:40 -0300
+Subject: [PATCH] fix(core): emit hooks for apply_patch edits (#18391)
+
+Fixes https://github.com/openai/codex/issues/16732.
+
+## Why
+
+`apply_patch` is Codex's primary file edit path, but it was not emitting
+`PreToolUse` or `PostToolUse` hook events. That meant hook-based policy,
+auditing, and write coordination could observe shell commands while
+missing the actual file mutation performed by `apply_patch`.
+
+The issue also exposed that the hook runtime serialized command hook
+payloads with `tool_name: "Bash"` unconditionally. Even if `apply_patch`
+supplied hook payloads, hooks would either fail to match it directly or
+receive misleading stdin that identified the edit as a Bash tool call.
+
+## What Changed
+
+- Added `PreToolUse` and `PostToolUse` payload support to
+`ApplyPatchHandler`.
+- Exposed the raw patch body as `tool_input.command` for both
+JSON/function and freeform `apply_patch` calls.
+- Taught tool hook payloads to carry a handler-supplied hook-facing
+`tool_name`.
+- Preserved existing shell compatibility by continuing to emit `Bash`
+for shell-like tools.
+- Serialized the selected hook `tool_name` into hook stdin instead of
+hardcoding `Bash`.
+- Relaxed the generated hook command input schema so `tool_name` can
+represent tools other than `Bash`.
+
+## Verification
+
+Added focused handler coverage for:
+
+- JSON/function `apply_patch` calls producing a `PreToolUse` payload.
+- Freeform `apply_patch` calls producing a `PreToolUse` payload.
+- Successful `apply_patch` output producing a `PostToolUse` payload.
+- Shell and `exec_command` handlers continuing to expose `Bash`.
+
+Added end-to-end hook coverage for:
+
+- A `PreToolUse` hook matching `^apply_patch$` blocking the patch before
+the target file is created.
+- A `PostToolUse` hook matching `^apply_patch$` receiving the patch
+input and tool response, then adding context to the follow-up model
+request.
+- Non-participating tools such as the plan tool continuing not to emit
+`PreToolUse`/`PostToolUse` hook events.
+
+Also validated manually with a live `codex exec` smoke test using an
+isolated temp workspace and temp `CODEX_HOME`. The smoke test confirmed
+that a real `apply_patch` edit emits `PreToolUse`/`PostToolUse` with
+`tool_name: "apply_patch"`, a shell command still emits `tool_name:
+"Bash"`, and a denying `PreToolUse` hook prevents the blocked patch file
+from being created.
+---
+ codex-rs/core/src/hook_runtime.rs             |  24 +-
+ codex-rs/core/src/tools/context.rs            |  11 +
+ .../core/src/tools/handlers/apply_patch.rs    |  40 ++
+ .../src/tools/handlers/apply_patch_tests.rs   |  85 ++++
+ codex-rs/core/src/tools/handlers/shell.rs     |  14 +-
+ .../core/src/tools/handlers/shell_tests.rs    |   4 +
+ .../core/src/tools/handlers/unified_exec.rs   |   7 +-
+ .../src/tools/handlers/unified_exec_tests.rs  |   3 +
+ codex-rs/core/src/tools/hook_names.rs         |  55 +++
+ codex-rs/core/src/tools/mod.rs                |   1 +
+ codex-rs/core/src/tools/network_approval.rs   |   3 +-
+ codex-rs/core/src/tools/registry.rs           |  18 +
+ .../core/src/tools/runtimes/apply_patch.rs    |  13 +
+ .../src/tools/runtimes/apply_patch_tests.rs   |  33 ++
+ codex-rs/core/src/tools/runtimes/shell.rs     |   3 +-
+ .../tools/runtimes/shell/unix_escalation.rs   |   3 +-
+ .../core/src/tools/runtimes/unified_exec.rs   |   3 +-
+ codex-rs/core/src/tools/sandboxing.rs         |   3 +-
+ codex-rs/core/tests/suite/approvals.rs        |   2 +
+ codex-rs/core/tests/suite/hooks.rs            | 422 +++++++++++++++++-
+ ...rmission-request.command.input.schema.json |   1 -
+ .../post-tool-use.command.input.schema.json   |   1 -
+ .../pre-tool-use.command.input.schema.json    |   1 -
+ codex-rs/hooks/src/engine/dispatcher.rs       |  66 ++-
+ codex-rs/hooks/src/events/common.rs           |  11 +
+ .../hooks/src/events/permission_request.rs    |  11 +-
+ codex-rs/hooks/src/events/post_tool_use.rs    |  64 ++-
+ codex-rs/hooks/src/events/pre_tool_use.rs     |  62 ++-
+ codex-rs/hooks/src/schema.rs                  |  15 -
+ 29 files changed, 901 insertions(+), 78 deletions(-)
+ create mode 100644 codex-rs/core/src/tools/hook_names.rs
+
+diff --git a/codex-rs/core/src/hook_runtime.rs b/codex-rs/core/src/hook_runtime.rs
+index d625e1b888a3..c647d146d46b 100644
+--- a/codex-rs/core/src/hook_runtime.rs
++++ b/codex-rs/core/src/hook_runtime.rs
+@@ -128,10 +128,17 @@ pub(crate) async fn run_pending_session_start_hooks(
+     .await
+ }
+ 
++/// Runs matching `PreToolUse` hooks before a tool executes.
++///
++/// `tool_name` is the canonical name serialized to hook stdin. Matcher aliases
++/// are internal compatibility names used only for selecting configured hook
++/// handlers.
+ pub(crate) async fn run_pre_tool_use_hooks(
+     sess: &Arc<Session>,
+     turn_context: &Arc<TurnContext>,
+     tool_use_id: String,
++    tool_name: String,
++    matcher_aliases: Vec<String>,
+     command: String,
+ ) -> Option<String> {
+     let request = PreToolUseRequest {
+@@ -141,7 +148,8 @@ pub(crate) async fn run_pre_tool_use_hooks(
+         transcript_path: sess.hook_transcript_path().await,
+         model: turn_context.model_info.slug.clone(),
+         permission_mode: hook_permission_mode(turn_context),
+-        tool_name: "Bash".to_string(),
++        tool_name,
++        matcher_aliases,
+         tool_use_id,
+         command,
+     };
+@@ -174,7 +182,8 @@ pub(crate) async fn run_permission_request_hooks(
+         transcript_path: sess.hook_transcript_path().await,
+         model: turn_context.model_info.slug.clone(),
+         permission_mode: hook_permission_mode(turn_context),
+-        tool_name: payload.tool_name,
++        tool_name: payload.tool_name.name().to_string(),
++        matcher_aliases: payload.tool_name.matcher_aliases().to_vec(),
+         run_id_suffix: run_id_suffix.to_string(),
+         command: payload.command,
+         description: payload.description,
+@@ -191,10 +200,18 @@ pub(crate) async fn run_permission_request_hooks(
+     decision
+ }
+ 
++/// Runs matching `PostToolUse` hooks after a tool has produced a successful output.
++///
++/// The `tool_name`, matcher aliases, `command`, and `tool_response` values are
++/// already adapted by the tool handler into the stable hook contract. Passing
++/// raw internal tool data here would leak implementation details into user hook
++/// matchers and hook logs.
+ pub(crate) async fn run_post_tool_use_hooks(
+     sess: &Arc<Session>,
+     turn_context: &Arc<TurnContext>,
+     tool_use_id: String,
++    tool_name: String,
++    matcher_aliases: Vec<String>,
+     command: String,
+     tool_response: Value,
+ ) -> PostToolUseOutcome {
+@@ -205,7 +222,8 @@ pub(crate) async fn run_post_tool_use_hooks(
+         transcript_path: sess.hook_transcript_path().await,
+         model: turn_context.model_info.slug.clone(),
+         permission_mode: hook_permission_mode(turn_context),
+-        tool_name: "Bash".to_string(),
++        tool_name,
++        matcher_aliases,
+         tool_use_id,
+         command,
+         tool_response,
+diff --git a/codex-rs/core/src/tools/context.rs b/codex-rs/core/src/tools/context.rs
+index 0060d5897389..15ada81bb96f 100644
+--- a/codex-rs/core/src/tools/context.rs
++++ b/codex-rs/core/src/tools/context.rs
+@@ -88,6 +88,13 @@ pub trait ToolOutput: Send {
+ 
+     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem;
+ 
++    /// Returns the stable value exposed to `PostToolUse` hooks for this tool output.
++    ///
++    /// Tool handlers decide whether a tool participates in `PostToolUse`, but
++    /// this method lets the output type own any conversion from model-facing
++    /// response content to hook-facing data. Returning `None` means the output
++    /// should not produce a post-use hook payload, not merely that the tool had
++    /// empty output.
+     fn post_tool_use_response(&self, _call_id: &str, _payload: &ToolPayload) -> Option<JsonValue> {
+         None
+     }
+@@ -306,6 +313,10 @@ impl ToolOutput for ApplyPatchToolOutput {
+         )
+     }
+ 
++    fn post_tool_use_response(&self, _call_id: &str, _payload: &ToolPayload) -> Option<JsonValue> {
++        Some(JsonValue::String(self.text.clone()))
++    }
++
+     fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
+         JsonValue::Object(serde_json::Map::new())
+     }
+diff --git a/codex-rs/core/src/tools/handlers/apply_patch.rs b/codex-rs/core/src/tools/handlers/apply_patch.rs
+index 033315a69489..8eca2caf3f07 100644
+--- a/codex-rs/core/src/tools/handlers/apply_patch.rs
++++ b/codex-rs/core/src/tools/handlers/apply_patch.rs
+@@ -16,12 +16,16 @@ use crate::tools::context::ApplyPatchToolOutput;
+ use crate::tools::context::FunctionToolOutput;
+ use crate::tools::context::SharedTurnDiffTracker;
+ use crate::tools::context::ToolInvocation;
++use crate::tools::context::ToolOutput;
+ use crate::tools::context::ToolPayload;
+ use crate::tools::events::ToolEmitter;
+ use crate::tools::events::ToolEventCtx;
+ use crate::tools::handlers::apply_granted_turn_permissions;
+ use crate::tools::handlers::parse_arguments;
++use crate::tools::hook_names::HookToolName;
+ use crate::tools::orchestrator::ToolOrchestrator;
++use crate::tools::registry::PostToolUsePayload;
++use crate::tools::registry::PreToolUsePayload;
+ use crate::tools::registry::ToolArgumentDiffConsumer;
+ use crate::tools::registry::ToolHandler;
+ use crate::tools::registry::ToolKind;
+@@ -239,6 +243,21 @@ fn write_permissions_for_paths(
+     normalize_additional_permissions(permissions).ok()
+ }
+ 
++/// Extracts the raw patch text used as the command-shaped hook input for apply_patch.
++///
++/// The apply_patch tool can arrive as the older JSON/function shape or as a
++/// freeform custom tool call. Both represent the same file edit operation, so
++/// hooks see the raw patch body in `tool_input.command` either way.
++fn apply_patch_payload_command(payload: &ToolPayload) -> Option<String> {
++    match payload {
++        ToolPayload::Function { arguments } => parse_arguments::<ApplyPatchToolArgs>(arguments)
++            .ok()
++            .map(|args| args.input),
++        ToolPayload::Custom { input } => Some(input.clone()),
++        _ => None,
++    }
++}
++
+ async fn effective_patch_permissions(
+     session: &Session,
+     turn: &TurnContext,
+@@ -294,6 +313,27 @@ impl ToolHandler for ApplyPatchHandler {
+         Some(Box::<ApplyPatchArgumentDiffConsumer>::default())
+     }
+ 
++    fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
++        apply_patch_payload_command(&invocation.payload).map(|command| PreToolUsePayload {
++            tool_name: HookToolName::apply_patch(),
++            command,
++        })
++    }
++
++    fn post_tool_use_payload(
++        &self,
++        call_id: &str,
++        payload: &ToolPayload,
++        result: &dyn ToolOutput,
++    ) -> Option<PostToolUsePayload> {
++        let tool_response = result.post_tool_use_response(call_id, payload)?;
++        Some(PostToolUsePayload {
++            tool_name: HookToolName::apply_patch(),
++            command: apply_patch_payload_command(payload)?,
++            tool_response,
++        })
++    }
++
+     async fn handle(&self, invocation: ToolInvocation) -> Result<Self::Output, FunctionCallError> {
+         let ToolInvocation {
+             session,
+diff --git a/codex-rs/core/src/tools/handlers/apply_patch_tests.rs b/codex-rs/core/src/tools/handlers/apply_patch_tests.rs
+index 39c8029e67d4..979b4d4e96d2 100644
+--- a/codex-rs/core/src/tools/handlers/apply_patch_tests.rs
++++ b/codex-rs/core/src/tools/handlers/apply_patch_tests.rs
+@@ -7,9 +7,94 @@ use codex_protocol::protocol::SandboxPolicy;
+ use core_test_support::PathBufExt;
+ use core_test_support::PathExt;
+ use pretty_assertions::assert_eq;
++use serde_json::json;
+ use std::collections::HashMap;
+ use std::path::PathBuf;
++use std::sync::Arc;
+ use tempfile::TempDir;
++use tokio::sync::Mutex;
++
++use crate::session::tests::make_session_and_context;
++use crate::tools::context::ToolInvocation;
++use crate::tools::hook_names::HookToolName;
++use crate::tools::registry::PostToolUsePayload;
++use crate::tools::registry::PreToolUsePayload;
++use crate::turn_diff_tracker::TurnDiffTracker;
++
++fn sample_patch() -> &'static str {
++    r#"*** Begin Patch
++*** Add File: hello.txt
+++hello
++*** End Patch"#
++}
++
++async fn invocation_for_payload(payload: ToolPayload) -> ToolInvocation {
++    let (session, turn) = make_session_and_context().await;
++    ToolInvocation {
++        session: session.into(),
++        turn: turn.into(),
++        cancellation_token: tokio_util::sync::CancellationToken::new(),
++        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
++        call_id: "call-apply-patch".to_string(),
++        tool_name: codex_tools::ToolName::plain("apply_patch"),
++        payload,
++    }
++}
++
++#[tokio::test]
++async fn pre_tool_use_payload_uses_json_patch_input() {
++    let patch = sample_patch();
++    let payload = ToolPayload::Function {
++        arguments: json!({ "input": patch }).to_string(),
++    };
++    let invocation = invocation_for_payload(payload).await;
++    let handler = ApplyPatchHandler;
++
++    assert_eq!(
++        handler.pre_tool_use_payload(&invocation),
++        Some(PreToolUsePayload {
++            tool_name: HookToolName::apply_patch(),
++            command: patch.to_string(),
++        })
++    );
++}
++
++#[tokio::test]
++async fn pre_tool_use_payload_uses_freeform_patch_input() {
++    let patch = sample_patch();
++    let payload = ToolPayload::Custom {
++        input: patch.to_string(),
++    };
++    let invocation = invocation_for_payload(payload).await;
++    let handler = ApplyPatchHandler;
++
++    assert_eq!(
++        handler.pre_tool_use_payload(&invocation),
++        Some(PreToolUsePayload {
++            tool_name: HookToolName::apply_patch(),
++            command: patch.to_string(),
++        })
++    );
++}
++
++#[test]
++fn post_tool_use_payload_uses_patch_input_and_tool_output() {
++    let patch = sample_patch();
++    let payload = ToolPayload::Custom {
++        input: patch.to_string(),
++    };
++    let output = ApplyPatchToolOutput::from_text("Success. Updated files.".to_string());
++    let handler = ApplyPatchHandler;
++
++    assert_eq!(
++        handler.post_tool_use_payload("call-apply-patch", &payload, &output),
++        Some(PostToolUsePayload {
++            tool_name: HookToolName::apply_patch(),
++            command: patch.to_string(),
++            tool_response: json!("Success. Updated files."),
++        })
++    );
++}
+ 
+ #[test]
+ fn diff_consumer_does_not_stream_json_tool_call_arguments() {
+diff --git a/codex-rs/core/src/tools/handlers/shell.rs b/codex-rs/core/src/tools/handlers/shell.rs
+index 8770238942f7..00343d3ceaf3 100644
+--- a/codex-rs/core/src/tools/handlers/shell.rs
++++ b/codex-rs/core/src/tools/handlers/shell.rs
+@@ -25,6 +25,7 @@ use crate::tools::handlers::normalize_and_validate_additional_permissions;
+ use crate::tools::handlers::parse_arguments;
+ use crate::tools::handlers::parse_arguments_with_base_path;
+ use crate::tools::handlers::resolve_workdir_base_path;
++use crate::tools::hook_names::HookToolName;
+ use crate::tools::orchestrator::ToolOrchestrator;
+ use crate::tools::registry::PostToolUsePayload;
+ use crate::tools::registry::PreToolUsePayload;
+@@ -205,7 +206,10 @@ impl ToolHandler for ShellHandler {
+     }
+ 
+     fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
+-        shell_payload_command(&invocation.payload).map(|command| PreToolUsePayload { command })
++        shell_payload_command(&invocation.payload).map(|command| PreToolUsePayload {
++            tool_name: HookToolName::bash(),
++            command,
++        })
+     }
+ 
+     fn post_tool_use_payload(
+@@ -216,6 +220,7 @@ impl ToolHandler for ShellHandler {
+     ) -> Option<PostToolUsePayload> {
+         let tool_response = result.post_tool_use_response(call_id, payload)?;
+         Some(PostToolUsePayload {
++            tool_name: HookToolName::bash(),
+             command: shell_payload_command(payload)?,
+             tool_response,
+         })
+@@ -313,8 +318,10 @@ impl ToolHandler for ShellCommandHandler {
+     }
+ 
+     fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
+-        shell_command_payload_command(&invocation.payload)
+-            .map(|command| PreToolUsePayload { command })
++        shell_command_payload_command(&invocation.payload).map(|command| PreToolUsePayload {
++            tool_name: HookToolName::bash(),
++            command,
++        })
+     }
+ 
+     fn post_tool_use_payload(
+@@ -325,6 +332,7 @@ impl ToolHandler for ShellCommandHandler {
+     ) -> Option<PostToolUsePayload> {
+         let tool_response = result.post_tool_use_response(call_id, payload)?;
+         Some(PostToolUsePayload {
++            tool_name: HookToolName::bash(),
+             command: shell_command_payload_command(payload)?,
+             tool_response,
+         })
+diff --git a/codex-rs/core/src/tools/handlers/shell_tests.rs b/codex-rs/core/src/tools/handlers/shell_tests.rs
+index 1cb79affb4fa..b36dd0225c97 100644
+--- a/codex-rs/core/src/tools/handlers/shell_tests.rs
++++ b/codex-rs/core/src/tools/handlers/shell_tests.rs
+@@ -17,6 +17,7 @@ use crate::tools::context::ToolInvocation;
+ use crate::tools::context::ToolPayload;
+ use crate::tools::handlers::ShellCommandHandler;
+ use crate::tools::handlers::ShellHandler;
++use crate::tools::hook_names::HookToolName;
+ use crate::tools::registry::ToolHandler;
+ use crate::turn_diff_tracker::TurnDiffTracker;
+ use codex_shell_command::is_safe_command::is_known_safe_command;
+@@ -232,6 +233,7 @@ async fn shell_pre_tool_use_payload_uses_joined_command() {
+             payload,
+         }),
+         Some(crate::tools::registry::PreToolUsePayload {
++            tool_name: HookToolName::bash(),
+             command: "bash -lc 'printf hi'".to_string(),
+         })
+     );
+@@ -258,6 +260,7 @@ async fn shell_command_pre_tool_use_payload_uses_raw_command() {
+             payload,
+         }),
+         Some(crate::tools::registry::PreToolUsePayload {
++            tool_name: HookToolName::bash(),
+             command: "printf shell command".to_string(),
+         })
+     );
+@@ -280,6 +283,7 @@ fn build_post_tool_use_payload_uses_tool_output_wire_value() {
+     assert_eq!(
+         handler.post_tool_use_payload("call-42", &payload, &output),
+         Some(crate::tools::registry::PostToolUsePayload {
++            tool_name: HookToolName::bash(),
+             command: "printf shell command".to_string(),
+             tool_response: json!("shell output"),
+         })
+diff --git a/codex-rs/core/src/tools/handlers/unified_exec.rs b/codex-rs/core/src/tools/handlers/unified_exec.rs
+index fd04d42f2ed8..b25f5a69b791 100644
+--- a/codex-rs/core/src/tools/handlers/unified_exec.rs
++++ b/codex-rs/core/src/tools/handlers/unified_exec.rs
+@@ -14,6 +14,7 @@ use crate::tools::handlers::normalize_and_validate_additional_permissions;
+ use crate::tools::handlers::parse_arguments;
+ use crate::tools::handlers::parse_arguments_with_base_path;
+ use crate::tools::handlers::resolve_workdir_base_path;
++use crate::tools::hook_names::HookToolName;
+ use crate::tools::registry::PostToolUsePayload;
+ use crate::tools::registry::PreToolUsePayload;
+ use crate::tools::registry::ToolHandler;
+@@ -136,7 +137,10 @@ impl ToolHandler for UnifiedExecHandler {
+ 
+         parse_arguments::<ExecCommandArgs>(arguments)
+             .ok()
+-            .map(|args| PreToolUsePayload { command: args.cmd })
++            .map(|args| PreToolUsePayload {
++                tool_name: HookToolName::bash(),
++                command: args.cmd,
++            })
+     }
+ 
+     fn post_tool_use_payload(
+@@ -156,6 +160,7 @@ impl ToolHandler for UnifiedExecHandler {
+ 
+         let tool_response = result.post_tool_use_response(call_id, payload)?;
+         Some(PostToolUsePayload {
++            tool_name: HookToolName::bash(),
+             command: args.cmd,
+             tool_response,
+         })
+diff --git a/codex-rs/core/src/tools/handlers/unified_exec_tests.rs b/codex-rs/core/src/tools/handlers/unified_exec_tests.rs
+index 988d224838a4..26f86bd66df9 100644
+--- a/codex-rs/core/src/tools/handlers/unified_exec_tests.rs
++++ b/codex-rs/core/src/tools/handlers/unified_exec_tests.rs
+@@ -17,6 +17,7 @@ use crate::session::tests::make_session_and_context;
+ use crate::tools::context::ExecCommandToolOutput;
+ use crate::tools::context::ToolInvocation;
+ use crate::tools::context::ToolPayload;
++use crate::tools::hook_names::HookToolName;
+ use crate::tools::registry::ToolHandler;
+ use crate::turn_diff_tracker::TurnDiffTracker;
+ use tokio::sync::Mutex;
+@@ -217,6 +218,7 @@ async fn exec_command_pre_tool_use_payload_uses_raw_command() {
+             payload,
+         }),
+         Some(crate::tools::registry::PreToolUsePayload {
++            tool_name: HookToolName::bash(),
+             command: "printf exec command".to_string(),
+         })
+     );
+@@ -268,6 +270,7 @@ fn exec_command_post_tool_use_payload_uses_output_for_noninteractive_one_shot_co
+     assert_eq!(
+         UnifiedExecHandler.post_tool_use_payload("call-43", &payload, &output),
+         Some(crate::tools::registry::PostToolUsePayload {
++            tool_name: HookToolName::bash(),
+             command: "echo three".to_string(),
+             tool_response: serde_json::json!("three"),
+         })
+diff --git a/codex-rs/core/src/tools/hook_names.rs b/codex-rs/core/src/tools/hook_names.rs
+new file mode 100644
+index 000000000000..9d3b6c2409ef
+--- /dev/null
++++ b/codex-rs/core/src/tools/hook_names.rs
+@@ -0,0 +1,55 @@
++//! Hook-facing tool names and matcher compatibility aliases.
++//!
++//! Hook stdin exposes one canonical `tool_name`, but matcher selection may also
++//! need to recognize names from adjacent tool ecosystems. Keeping those two
++//! concepts together prevents handlers from accidentally serializing a
++//! compatibility alias, such as `Write`, as the stable hook payload name.
++
++/// Identifies a tool in hook payloads and hook matcher selection.
++///
++/// `name` is the canonical value serialized into hook stdin. Matcher aliases are
++/// internal-only compatibility names that may select the same hook handlers but
++/// must not change the payload seen by hook processes.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(crate) struct HookToolName {
++    name: String,
++    matcher_aliases: Vec<String>,
++}
++
++impl HookToolName {
++    /// Builds a hook tool name with no matcher aliases.
++    pub(crate) fn new(name: impl Into<String>) -> Self {
++        Self {
++            name: name.into(),
++            matcher_aliases: Vec::new(),
++        }
++    }
++
++    /// Returns the hook identity for file edits performed through `apply_patch`.
++    ///
++    /// The serialized name remains `apply_patch` so logs and policies can key
++    /// off the actual Codex tool. `Write` and `Edit` are accepted as matcher
++    /// aliases for compatibility with hook configurations that describe edits
++    /// using Claude Code-style names.
++    pub(crate) fn apply_patch() -> Self {
++        Self {
++            name: "apply_patch".to_string(),
++            matcher_aliases: vec!["Write".to_string(), "Edit".to_string()],
++        }
++    }
++
++    /// Returns the hook identity historically used for shell-like tools.
++    pub(crate) fn bash() -> Self {
++        Self::new("Bash")
++    }
++
++    /// Returns the canonical hook name serialized into hook stdin.
++    pub(crate) fn name(&self) -> &str {
++        &self.name
++    }
++
++    /// Returns additional matcher inputs that should select the same handlers.
++    pub(crate) fn matcher_aliases(&self) -> &[String] {
++        &self.matcher_aliases
++    }
++}
+diff --git a/codex-rs/core/src/tools/mod.rs b/codex-rs/core/src/tools/mod.rs
+index ee790d7d2ac9..ebee03b03123 100644
+--- a/codex-rs/core/src/tools/mod.rs
++++ b/codex-rs/core/src/tools/mod.rs
+@@ -2,6 +2,7 @@ pub(crate) mod code_mode;
+ pub(crate) mod context;
+ pub(crate) mod events;
+ pub(crate) mod handlers;
++pub(crate) mod hook_names;
+ pub(crate) mod js_repl;
+ pub(crate) mod network_approval;
+ pub(crate) mod orchestrator;
+diff --git a/codex-rs/core/src/tools/network_approval.rs b/codex-rs/core/src/tools/network_approval.rs
+index 21dda6bff815..4be18bad844c 100644
+--- a/codex-rs/core/src/tools/network_approval.rs
++++ b/codex-rs/core/src/tools/network_approval.rs
+@@ -7,6 +7,7 @@ use crate::guardian::routes_approval_to_guardian;
+ use crate::hook_runtime::run_permission_request_hooks;
+ use crate::network_policy_decision::denied_network_policy_message;
+ use crate::session::session::Session;
++use crate::tools::hook_names::HookToolName;
+ use crate::tools::sandboxing::PermissionRequestPayload;
+ use crate::tools::sandboxing::ToolError;
+ use codex_hooks::PermissionRequestDecision;
+@@ -383,7 +384,7 @@ impl NetworkApprovalService {
+             &turn_context,
+             &guardian_approval_id,
+             PermissionRequestPayload {
+-                tool_name: "Bash".to_string(),
++                tool_name: HookToolName::bash(),
+                 command,
+                 description: Some(format!("network-access {target}")),
+             },
+diff --git a/codex-rs/core/src/tools/registry.rs b/codex-rs/core/src/tools/registry.rs
+index aca1d101445d..d70550d0e542 100644
+--- a/codex-rs/core/src/tools/registry.rs
++++ b/codex-rs/core/src/tools/registry.rs
+@@ -14,6 +14,7 @@ use crate::tools::context::FunctionToolOutput;
+ use crate::tools::context::ToolInvocation;
+ use crate::tools::context::ToolOutput;
+ use crate::tools::context::ToolPayload;
++use crate::tools::hook_names::HookToolName;
+ use codex_hooks::HookEvent;
+ use codex_hooks::HookEventAfterToolUse;
+ use codex_hooks::HookPayload;
+@@ -129,12 +130,25 @@ impl AnyToolResult {
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub(crate) struct PreToolUsePayload {
++    /// Hook-facing tool name model.
++    ///
++    /// The canonical name is serialized to hook stdin, while aliases are used
++    /// only for matcher compatibility.
++    pub(crate) tool_name: HookToolName,
++    /// Command-shaped input exposed at `tool_input.command`.
+     pub(crate) command: String,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq)]
+ pub(crate) struct PostToolUsePayload {
++    /// Hook-facing tool name model.
++    ///
++    /// Keep this aligned with the corresponding pre-use payload so external
++    /// hook consumers can pair events by `tool_use_id`.
++    pub(crate) tool_name: HookToolName,
++    /// Command-shaped input exposed at `tool_input.command`.
+     pub(crate) command: String,
++    /// Tool result exposed at `tool_response`.
+     pub(crate) tool_response: Value,
+ }
+ 
+@@ -330,6 +344,8 @@ impl ToolRegistry {
+                 &invocation.session,
+                 &invocation.turn,
+                 invocation.call_id.clone(),
++                pre_tool_use_payload.tool_name.name().to_string(),
++                pre_tool_use_payload.tool_name.matcher_aliases().to_vec(),
+                 pre_tool_use_payload.command.clone(),
+             )
+             .await
+@@ -400,6 +416,8 @@ impl ToolRegistry {
+                     &invocation.session,
+                     &invocation.turn,
+                     invocation.call_id.clone(),
++                    post_tool_use_payload.tool_name.name().to_string(),
++                    post_tool_use_payload.tool_name.matcher_aliases().to_vec(),
+                     post_tool_use_payload.command,
+                     post_tool_use_payload.tool_response,
+                 )
+diff --git a/codex-rs/core/src/tools/runtimes/apply_patch.rs b/codex-rs/core/src/tools/runtimes/apply_patch.rs
+index aac8e6bc1340..1d9454be9c08 100644
+--- a/codex-rs/core/src/tools/runtimes/apply_patch.rs
++++ b/codex-rs/core/src/tools/runtimes/apply_patch.rs
+@@ -6,9 +6,11 @@
+ use crate::exec::is_likely_sandbox_denied;
+ use crate::guardian::GuardianApprovalRequest;
+ use crate::guardian::review_approval_request;
++use crate::tools::hook_names::HookToolName;
+ use crate::tools::sandboxing::Approvable;
+ use crate::tools::sandboxing::ApprovalCtx;
+ use crate::tools::sandboxing::ExecApprovalRequirement;
++use crate::tools::sandboxing::PermissionRequestPayload;
+ use crate::tools::sandboxing::SandboxAttempt;
+ use crate::tools::sandboxing::Sandboxable;
+ use crate::tools::sandboxing::ToolCtx;
+@@ -198,6 +200,17 @@ impl Approvable<ApplyPatchRequest> for ApplyPatchRuntime {
+     ) -> Option<ExecApprovalRequirement> {
+         Some(req.exec_approval_requirement.clone())
+     }
++
++    fn permission_request_payload(
++        &self,
++        req: &ApplyPatchRequest,
++    ) -> Option<PermissionRequestPayload> {
++        Some(PermissionRequestPayload {
++            tool_name: HookToolName::apply_patch(),
++            command: req.action.patch.clone(),
++            description: None,
++        })
++    }
+ }
+ 
+ impl ToolRuntime<ApplyPatchRequest, ExecToolCallOutput> for ApplyPatchRuntime {
+diff --git a/codex-rs/core/src/tools/runtimes/apply_patch_tests.rs b/codex-rs/core/src/tools/runtimes/apply_patch_tests.rs
+index 7f3641c03c51..5e6359d3ec51 100644
+--- a/codex-rs/core/src/tools/runtimes/apply_patch_tests.rs
++++ b/codex-rs/core/src/tools/runtimes/apply_patch_tests.rs
+@@ -78,6 +78,39 @@ fn guardian_review_request_includes_patch_context() {
+     );
+ }
+ 
++#[test]
++fn permission_request_payload_uses_apply_patch_hook_name_and_aliases() {
++    let runtime = ApplyPatchRuntime::new();
++    let path = std::env::temp_dir()
++        .join("apply-patch-permission-request-payload.txt")
++        .abs();
++    let action = ApplyPatchAction::new_add_for_test(&path, "hello".to_string());
++    let expected_patch = action.patch.clone();
++    let req = ApplyPatchRequest {
++        action,
++        file_paths: vec![path],
++        changes: HashMap::new(),
++        exec_approval_requirement: ExecApprovalRequirement::NeedsApproval {
++            reason: None,
++            proposed_execpolicy_amendment: None,
++        },
++        additional_permissions: None,
++        permissions_preapproved: false,
++    };
++
++    let payload = runtime
++        .permission_request_payload(&req)
++        .expect("permission request payload");
++
++    assert_eq!(payload.tool_name.name(), "apply_patch");
++    assert_eq!(
++        payload.tool_name.matcher_aliases(),
++        &["Write".to_string(), "Edit".to_string()]
++    );
++    assert_eq!(payload.command, expected_patch);
++    assert_eq!(payload.description, None);
++}
++
+ #[test]
+ fn file_system_sandbox_context_uses_active_attempt() {
+     let path = std::env::temp_dir()
+diff --git a/codex-rs/core/src/tools/runtimes/shell.rs b/codex-rs/core/src/tools/runtimes/shell.rs
+index 21bf0e64cc08..34292421a088 100644
+--- a/codex-rs/core/src/tools/runtimes/shell.rs
++++ b/codex-rs/core/src/tools/runtimes/shell.rs
+@@ -16,6 +16,7 @@ use crate::sandboxing::ExecOptions;
+ use crate::sandboxing::SandboxPermissions;
+ use crate::sandboxing::execute_env;
+ use crate::shell::ShellType;
++use crate::tools::hook_names::HookToolName;
+ use crate::tools::network_approval::NetworkApprovalMode;
+ use crate::tools::network_approval::NetworkApprovalSpec;
+ use crate::tools::runtimes::build_sandbox_command;
+@@ -201,7 +202,7 @@ impl Approvable<ShellRequest> for ShellRuntime {
+ 
+     fn permission_request_payload(&self, req: &ShellRequest) -> Option<PermissionRequestPayload> {
+         Some(PermissionRequestPayload {
+-            tool_name: "Bash".to_string(),
++            tool_name: HookToolName::bash(),
+             command: req.hook_command.clone(),
+             description: req.justification.clone(),
+         })
+diff --git a/codex-rs/core/src/tools/runtimes/shell/unix_escalation.rs b/codex-rs/core/src/tools/runtimes/shell/unix_escalation.rs
+index 2e8859419316..361de9a96baa 100644
+--- a/codex-rs/core/src/tools/runtimes/shell/unix_escalation.rs
++++ b/codex-rs/core/src/tools/runtimes/shell/unix_escalation.rs
+@@ -13,6 +13,7 @@ use crate::sandboxing::ExecOptions;
+ use crate::sandboxing::ExecRequest;
+ use crate::sandboxing::SandboxPermissions;
+ use crate::shell::ShellType;
++use crate::tools::hook_names::HookToolName;
+ use crate::tools::runtimes::build_sandbox_command;
+ use crate::tools::sandboxing::PermissionRequestPayload;
+ use crate::tools::sandboxing::SandboxAttempt;
+@@ -402,7 +403,7 @@ impl CoreShellActionProvider {
+             .pause_for(async move {
+                 // 1) Run PermissionRequest hooks
+                 let permission_request = PermissionRequestPayload {
+-                    tool_name: "Bash".to_string(),
++                    tool_name: HookToolName::bash(),
+                     command: codex_shell_command::parse_command::shlex_join(&command),
+                     description: None,
+                 };
+diff --git a/codex-rs/core/src/tools/runtimes/unified_exec.rs b/codex-rs/core/src/tools/runtimes/unified_exec.rs
+index fdd434e5425d..955f7d830cee 100644
+--- a/codex-rs/core/src/tools/runtimes/unified_exec.rs
++++ b/codex-rs/core/src/tools/runtimes/unified_exec.rs
+@@ -13,6 +13,7 @@ use crate::sandboxing::ExecOptions;
+ use crate::sandboxing::ExecServerEnvConfig;
+ use crate::sandboxing::SandboxPermissions;
+ use crate::shell::ShellType;
++use crate::tools::hook_names::HookToolName;
+ use crate::tools::network_approval::NetworkApprovalMode;
+ use crate::tools::network_approval::NetworkApprovalSpec;
+ use crate::tools::runtimes::build_sandbox_command;
+@@ -186,7 +187,7 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
+         req: &UnifiedExecRequest,
+     ) -> Option<PermissionRequestPayload> {
+         Some(PermissionRequestPayload {
+-            tool_name: "Bash".to_string(),
++            tool_name: HookToolName::bash(),
+             command: req.hook_command.clone(),
+             description: req.justification.clone(),
+         })
+diff --git a/codex-rs/core/src/tools/sandboxing.rs b/codex-rs/core/src/tools/sandboxing.rs
+index a40fa0fed033..fcdcd785072f 100644
+--- a/codex-rs/core/src/tools/sandboxing.rs
++++ b/codex-rs/core/src/tools/sandboxing.rs
+@@ -9,6 +9,7 @@ use crate::sandboxing::SandboxPermissions;
+ use crate::session::session::Session;
+ use crate::session::turn_context::TurnContext;
+ use crate::state::SessionServices;
++use crate::tools::hook_names::HookToolName;
+ use crate::tools::network_approval::NetworkApprovalSpec;
+ use codex_network_proxy::NetworkProxy;
+ use codex_protocol::approvals::ExecPolicyAmendment;
+@@ -133,7 +134,7 @@ pub(crate) struct ApprovalCtx<'a> {
+ 
+ #[derive(Clone, Debug, PartialEq, Eq)]
+ pub(crate) struct PermissionRequestPayload {
+-    pub tool_name: String,
++    pub tool_name: HookToolName,
+     pub command: String,
+     pub description: Option<String>,
+ }
+diff --git a/codex-rs/core/tests/suite/approvals.rs b/codex-rs/core/tests/suite/approvals.rs
+index 3347213bf6b4..1a29d201b45d 100644
+--- a/codex-rs/core/tests/suite/approvals.rs
++++ b/codex-rs/core/tests/suite/approvals.rs
+@@ -1,6 +1,7 @@
+ #![allow(clippy::unwrap_used, clippy::expect_used)]
+ 
+ use anyhow::Result;
++use codex_config::types::ApprovalsReviewer;
+ use codex_core::CodexThread;
+ use codex_core::config::Constrained;
+ use codex_core::config_loader::ConfigLayerStack;
+@@ -1809,6 +1810,7 @@ async fn approving_apply_patch_for_session_skips_future_prompts_for_same_file()
+         .with_config(move |config| {
+             config.permissions.approval_policy = Constrained::allow_any(approval_policy);
+             config.permissions.sandbox_policy = Constrained::allow_any(sandbox_policy_for_config);
++            config.approvals_reviewer = ApprovalsReviewer::User;
+         });
+     let test = builder.build(&server).await?;
+ 
+diff --git a/codex-rs/core/tests/suite/hooks.rs b/codex-rs/core/tests/suite/hooks.rs
+index 5c71516f40a1..4c96de85fa81 100644
+--- a/codex-rs/core/tests/suite/hooks.rs
++++ b/codex-rs/core/tests/suite/hooks.rs
+@@ -21,6 +21,7 @@ use codex_protocol::protocol::RolloutItem;
+ use codex_protocol::protocol::RolloutLine;
+ use codex_protocol::protocol::SandboxPolicy;
+ use codex_protocol::user_input::UserInput;
++use core_test_support::responses::ev_apply_patch_function_call;
+ use core_test_support::responses::ev_assistant_message;
+ use core_test_support::responses::ev_completed;
+ use core_test_support::responses::ev_function_call;
+@@ -505,11 +506,12 @@ fn read_permission_request_hook_inputs(home: &Path) -> Result<Vec<serde_json::Va
+ 
+ fn assert_permission_request_hook_input(
+     hook_input: &Value,
++    tool_name: &str,
+     command: &str,
+     description: Option<&str>,
+ ) {
+     assert_eq!(hook_input["hook_event_name"], "PermissionRequest");
+-    assert_eq!(hook_input["tool_name"], "Bash");
++    assert_eq!(hook_input["tool_name"], tool_name);
+     assert_eq!(hook_input["tool_input"]["command"], command);
+     assert_eq!(
+         hook_input["tool_input"]["description"],
+@@ -527,10 +529,19 @@ fn assert_single_permission_request_hook_input(
+     home: &Path,
+     command: &str,
+     description: Option<&str>,
++) -> Result<Vec<serde_json::Value>> {
++    assert_single_permission_request_hook_input_for_tool(home, "Bash", command, description)
++}
++
++fn assert_single_permission_request_hook_input_for_tool(
++    home: &Path,
++    tool_name: &str,
++    command: &str,
++    description: Option<&str>,
+ ) -> Result<Vec<serde_json::Value>> {
+     let hook_inputs = read_permission_request_hook_inputs(home)?;
+     assert_eq!(hook_inputs.len(), 1);
+-    assert_permission_request_hook_input(&hook_inputs[0], command, description);
++    assert_permission_request_hook_input(&hook_inputs[0], tool_name, command, description);
+     Ok(hook_inputs)
+ }
+ 
+@@ -1223,6 +1234,89 @@ async fn permission_request_hook_allows_shell_command_without_user_approval() ->
+     Ok(())
+ }
+ 
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn permission_request_hook_allows_apply_patch_with_write_alias() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = start_mock_server().await;
++    let call_id = "permissionrequest-apply-patch";
++    let file_name = "permission_request_apply_patch.txt";
++    let patch_path = format!("../{file_name}");
++    let patch = format!(
++        r#"*** Begin Patch
++*** Add File: {patch_path}
+++approved
++*** End Patch"#
++    );
++    let responses = mount_sse_sequence(
++        &server,
++        vec![
++            sse(vec![
++                ev_response_created("resp-1"),
++                ev_apply_patch_function_call(call_id, &patch),
++                ev_completed("resp-1"),
++            ]),
++            sse(vec![
++                ev_response_created("resp-2"),
++                ev_assistant_message("msg-1", "permission request hook allowed apply_patch"),
++                ev_completed("resp-2"),
++            ]),
++        ],
++    )
++    .await;
++
++    let mut builder = test_codex()
++        .with_pre_build_hook(|home| {
++            if let Err(error) = write_permission_request_hook(
++                home,
++                Some("^Write$"),
++                "allow",
++                PERMISSION_REQUEST_ALLOW_REASON,
++            ) {
++                panic!("failed to write permission request hook test fixture: {error}");
++            }
++        })
++        .with_config(|config| {
++            config.include_apply_patch_tool = true;
++            config
++                .features
++                .enable(Feature::CodexHooks)
++                .expect("test config should allow feature update");
++        });
++    let test = builder.build(&server).await?;
++    let target_path = test.workspace_path(&patch_path);
++
++    test.submit_turn_with_policies(
++        "apply the patch after hook approval",
++        AskForApproval::OnRequest,
++        SandboxPolicy::WorkspaceWrite {
++            writable_roots: vec![],
++            read_only_access: Default::default(),
++            network_access: false,
++            exclude_tmpdir_env_var: true,
++            exclude_slash_tmp: true,
++        },
++    )
++    .await?;
++
++    let requests = responses.requests();
++    assert_eq!(requests.len(), 2);
++    requests[1].function_call_output(call_id);
++    assert!(
++        target_path.exists(),
++        "approved apply_patch should create the out-of-workspace file"
++    );
++
++    assert_single_permission_request_hook_input_for_tool(
++        test.codex_home_path(),
++        "apply_patch",
++        &patch,
++        /*description*/ None,
++    )?;
++
++    Ok(())
++}
++
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn permission_request_hook_sees_raw_exec_command_input() -> Result<()> {
+     skip_if_no_network!(Ok(()));
+@@ -1814,7 +1908,159 @@ async fn pre_tool_use_blocks_exec_command_before_execution() -> Result<()> {
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn pre_tool_use_does_not_fire_for_non_shell_tools() -> Result<()> {
++async fn pre_tool_use_blocks_apply_patch_before_execution() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = start_mock_server().await;
++    let call_id = "pretooluse-apply-patch";
++    let file_name = "pre_tool_use_apply_patch.txt";
++    let patch = format!(
++        r#"*** Begin Patch
++*** Add File: {file_name}
+++blocked
++*** End Patch"#
++    );
++    let responses = mount_sse_sequence(
++        &server,
++        vec![
++            sse(vec![
++                ev_response_created("resp-1"),
++                ev_apply_patch_function_call(call_id, &patch),
++                ev_completed("resp-1"),
++            ]),
++            sse(vec![
++                ev_response_created("resp-2"),
++                ev_assistant_message("msg-1", "apply_patch blocked"),
++                ev_completed("resp-2"),
++            ]),
++        ],
++    )
++    .await;
++
++    let mut builder = test_codex()
++        .with_pre_build_hook(|home| {
++            if let Err(error) = write_pre_tool_use_hook(
++                home,
++                Some("^apply_patch$"),
++                "json_deny",
++                "blocked apply_patch",
++            ) {
++                panic!("failed to write pre tool use hook test fixture: {error}");
++            }
++        })
++        .with_config(|config| {
++            config.include_apply_patch_tool = true;
++            config
++                .features
++                .enable(Feature::CodexHooks)
++                .expect("test config should allow feature update");
++        });
++    let test = builder.build(&server).await?;
++
++    test.submit_turn("apply the blocked patch").await?;
++
++    let requests = responses.requests();
++    assert_eq!(requests.len(), 2);
++    let output_item = requests[1].function_call_output(call_id);
++    let output = output_item
++        .get("output")
++        .and_then(Value::as_str)
++        .expect("apply_patch output string");
++    assert!(
++        output.contains("Command blocked by PreToolUse hook: blocked apply_patch"),
++        "blocked apply_patch output should surface the hook reason",
++    );
++    assert!(
++        !test.workspace_path(file_name).exists(),
++        "blocked apply_patch should not create the file"
++    );
++
++    let hook_inputs = read_pre_tool_use_hook_inputs(test.codex_home_path())?;
++    assert_eq!(hook_inputs.len(), 1);
++    assert_eq!(hook_inputs[0]["tool_name"], "apply_patch");
++    assert_eq!(hook_inputs[0]["tool_use_id"], call_id);
++    assert_eq!(hook_inputs[0]["tool_input"]["command"], patch);
++
++    Ok(())
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn pre_tool_use_blocks_apply_patch_with_write_alias() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = start_mock_server().await;
++    let call_id = "pretooluse-apply-patch-write";
++    let file_name = "pre_tool_use_apply_patch_write.txt";
++    let patch = format!(
++        r#"*** Begin Patch
++*** Add File: {file_name}
+++blocked
++*** End Patch"#
++    );
++    let responses = mount_sse_sequence(
++        &server,
++        vec![
++            sse(vec![
++                ev_response_created("resp-1"),
++                ev_apply_patch_function_call(call_id, &patch),
++                ev_completed("resp-1"),
++            ]),
++            sse(vec![
++                ev_response_created("resp-2"),
++                ev_assistant_message("msg-1", "apply_patch blocked by Write alias"),
++                ev_completed("resp-2"),
++            ]),
++        ],
++    )
++    .await;
++
++    let mut builder = test_codex()
++        .with_pre_build_hook(|home| {
++            if let Err(error) =
++                write_pre_tool_use_hook(home, Some("^Write$"), "json_deny", "blocked write alias")
++            {
++                panic!("failed to write pre tool use hook test fixture: {error}");
++            }
++        })
++        .with_config(|config| {
++            config.include_apply_patch_tool = true;
++            config
++                .features
++                .enable(Feature::CodexHooks)
++                .expect("test config should allow feature update");
++        });
++    let test = builder.build(&server).await?;
++
++    test.submit_turn("apply the patch blocked by Write alias")
++        .await?;
++
++    let requests = responses.requests();
++    assert_eq!(requests.len(), 2);
++    let output_item = requests[1].function_call_output(call_id);
++    let output = output_item
++        .get("output")
++        .and_then(Value::as_str)
++        .expect("apply_patch output string");
++    assert!(
++        output.contains("Command blocked by PreToolUse hook: blocked write alias"),
++        "blocked apply_patch output should surface the hook reason",
++    );
++    assert!(
++        !test.workspace_path(file_name).exists(),
++        "blocked apply_patch should not create the file"
++    );
++
++    let hook_inputs = read_pre_tool_use_hook_inputs(test.codex_home_path())?;
++    assert_eq!(hook_inputs.len(), 1);
++    assert_eq!(hook_inputs[0]["tool_name"], "apply_patch");
++    assert_eq!(hook_inputs[0]["tool_use_id"], call_id);
++    assert_eq!(hook_inputs[0]["tool_input"]["command"], patch);
++
++    Ok(())
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn pre_tool_use_does_not_fire_for_plan_tool() -> Result<()> {
+     skip_if_no_network!(Ok(()));
+ 
+     let server = start_mock_server().await;
+@@ -1879,7 +2125,7 @@ async fn pre_tool_use_does_not_fire_for_non_shell_tools() -> Result<()> {
+     let hook_log_path = test.codex_home_path().join("pre_tool_use_hook_log.jsonl");
+     assert!(
+         !hook_log_path.exists(),
+-        "non-shell tools should not trigger pre tool use hooks",
++        "plan tool should not trigger pre tool use hooks",
+     );
+ 
+     Ok(())
+@@ -2269,7 +2515,171 @@ async fn post_tool_use_exit_two_replaces_one_shot_exec_command_output_with_feedb
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn post_tool_use_does_not_fire_for_non_shell_tools() -> Result<()> {
++async fn post_tool_use_records_additional_context_for_apply_patch() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = start_mock_server().await;
++    let call_id = "posttooluse-apply-patch";
++    let file_name = "post_tool_use_apply_patch.txt";
++    let patch = format!(
++        r#"*** Begin Patch
++*** Add File: {file_name}
+++patched
++*** End Patch"#
++    );
++    let responses = mount_sse_sequence(
++        &server,
++        vec![
++            sse(vec![
++                ev_response_created("resp-1"),
++                ev_apply_patch_function_call(call_id, &patch),
++                ev_completed("resp-1"),
++            ]),
++            sse(vec![
++                ev_response_created("resp-2"),
++                ev_assistant_message("msg-1", "apply_patch post hook context observed"),
++                ev_completed("resp-2"),
++            ]),
++        ],
++    )
++    .await;
++
++    let post_context = "Remember the apply_patch post-tool note.";
++    let mut builder = test_codex()
++        .with_pre_build_hook(|home| {
++            if let Err(error) =
++                write_post_tool_use_hook(home, Some("^apply_patch$"), "context", post_context)
++            {
++                panic!("failed to write post tool use hook test fixture: {error}");
++            }
++        })
++        .with_config(|config| {
++            config.include_apply_patch_tool = true;
++            config
++                .features
++                .enable(Feature::CodexHooks)
++                .expect("test config should allow feature update");
++        });
++    let test = builder.build(&server).await?;
++
++    test.submit_turn("apply the patch with post hook").await?;
++
++    let requests = responses.requests();
++    assert_eq!(requests.len(), 2);
++    assert!(
++        requests[1]
++            .message_input_texts("developer")
++            .contains(&post_context.to_string()),
++        "follow-up request should include apply_patch post tool use context",
++    );
++    assert!(
++        test.workspace_path(file_name).exists(),
++        "apply_patch should create the file"
++    );
++
++    let hook_inputs = read_post_tool_use_hook_inputs(test.codex_home_path())?;
++    assert_eq!(hook_inputs.len(), 1);
++    assert_eq!(hook_inputs[0]["tool_name"], "apply_patch");
++    assert_eq!(hook_inputs[0]["tool_use_id"], call_id);
++    assert_eq!(hook_inputs[0]["tool_input"]["command"], patch);
++    let tool_response = hook_inputs[0]["tool_response"]
++        .as_str()
++        .context("apply_patch tool_response should be a string")?;
++    let mut parsed_tool_response = serde_json::from_str::<Value>(tool_response)?;
++    if let Some(metadata) = parsed_tool_response
++        .get_mut("metadata")
++        .and_then(Value::as_object_mut)
++    {
++        let _ = metadata.remove("duration_seconds");
++    }
++    assert_eq!(
++        parsed_tool_response,
++        serde_json::json!({
++            "output": "Success. Updated the following files:\nA post_tool_use_apply_patch.txt\n",
++            "metadata": {
++                "exit_code": 0,
++            },
++        })
++    );
++
++    Ok(())
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn post_tool_use_records_apply_patch_context_with_edit_alias() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = start_mock_server().await;
++    let call_id = "posttooluse-apply-patch-edit";
++    let file_name = "post_tool_use_apply_patch_edit.txt";
++    let patch = format!(
++        r#"*** Begin Patch
++*** Add File: {file_name}
+++patched
++*** End Patch"#
++    );
++    let responses = mount_sse_sequence(
++        &server,
++        vec![
++            sse(vec![
++                ev_response_created("resp-1"),
++                ev_apply_patch_function_call(call_id, &patch),
++                ev_completed("resp-1"),
++            ]),
++            sse(vec![
++                ev_response_created("resp-2"),
++                ev_assistant_message("msg-1", "apply_patch edit hook context observed"),
++                ev_completed("resp-2"),
++            ]),
++        ],
++    )
++    .await;
++
++    let post_context = "Remember the edit alias post-tool note.";
++    let mut builder = test_codex()
++        .with_pre_build_hook(|home| {
++            if let Err(error) =
++                write_post_tool_use_hook(home, Some("^Edit$"), "context", post_context)
++            {
++                panic!("failed to write post tool use hook test fixture: {error}");
++            }
++        })
++        .with_config(|config| {
++            config.include_apply_patch_tool = true;
++            config
++                .features
++                .enable(Feature::CodexHooks)
++                .expect("test config should allow feature update");
++        });
++    let test = builder.build(&server).await?;
++
++    test.submit_turn("apply the patch with edit alias post hook")
++        .await?;
++
++    let requests = responses.requests();
++    assert_eq!(requests.len(), 2);
++    assert!(
++        requests[1]
++            .message_input_texts("developer")
++            .contains(&post_context.to_string()),
++        "follow-up request should include apply_patch post tool use context",
++    );
++    assert!(
++        test.workspace_path(file_name).exists(),
++        "apply_patch should create the file"
++    );
++
++    let hook_inputs = read_post_tool_use_hook_inputs(test.codex_home_path())?;
++    assert_eq!(hook_inputs.len(), 1);
++    assert_eq!(hook_inputs[0]["tool_name"], "apply_patch");
++    assert_eq!(hook_inputs[0]["tool_use_id"], call_id);
++    assert_eq!(hook_inputs[0]["tool_input"]["command"], patch);
++
++    Ok(())
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn post_tool_use_does_not_fire_for_plan_tool() -> Result<()> {
+     skip_if_no_network!(Ok(()));
+ 
+     let server = start_mock_server().await;
+@@ -2337,7 +2747,7 @@ async fn post_tool_use_does_not_fire_for_non_shell_tools() -> Result<()> {
+     let hook_log_path = test.codex_home_path().join("post_tool_use_hook_log.jsonl");
+     assert!(
+         !hook_log_path.exists(),
+-        "non-shell tools should not trigger post tool use hooks",
++        "plan tool should not trigger post tool use hooks",
+     );
+ 
+     Ok(())
+diff --git a/codex-rs/hooks/schema/generated/permission-request.command.input.schema.json b/codex-rs/hooks/schema/generated/permission-request.command.input.schema.json
+index 744ab0cf95c3..7d432e1551ee 100644
+--- a/codex-rs/hooks/schema/generated/permission-request.command.input.schema.json
++++ b/codex-rs/hooks/schema/generated/permission-request.command.input.schema.json
+@@ -52,7 +52,6 @@
+       "$ref": "#/definitions/PermissionRequestToolInput"
+     },
+     "tool_name": {
+-      "const": "Bash",
+       "type": "string"
+     },
+     "transcript_path": {
+diff --git a/codex-rs/hooks/schema/generated/post-tool-use.command.input.schema.json b/codex-rs/hooks/schema/generated/post-tool-use.command.input.schema.json
+index e8a87c1f5e5d..6a3fcfc47c89 100644
+--- a/codex-rs/hooks/schema/generated/post-tool-use.command.input.schema.json
++++ b/codex-rs/hooks/schema/generated/post-tool-use.command.input.schema.json
+@@ -49,7 +49,6 @@
+       "$ref": "#/definitions/PostToolUseToolInput"
+     },
+     "tool_name": {
+-      "const": "Bash",
+       "type": "string"
+     },
+     "tool_response": true,
+diff --git a/codex-rs/hooks/schema/generated/pre-tool-use.command.input.schema.json b/codex-rs/hooks/schema/generated/pre-tool-use.command.input.schema.json
+index 86dfac165c8d..df3bec7ff6e5 100644
+--- a/codex-rs/hooks/schema/generated/pre-tool-use.command.input.schema.json
++++ b/codex-rs/hooks/schema/generated/pre-tool-use.command.input.schema.json
+@@ -49,7 +49,6 @@
+       "$ref": "#/definitions/PreToolUseToolInput"
+     },
+     "tool_name": {
+-      "const": "Bash",
+       "type": "string"
+     },
+     "tool_use_id": {
+diff --git a/codex-rs/hooks/src/engine/dispatcher.rs b/codex-rs/hooks/src/engine/dispatcher.rs
+index bd3a04927afc..d2c342897d65 100644
+--- a/codex-rs/hooks/src/engine/dispatcher.rs
++++ b/codex-rs/hooks/src/engine/dispatcher.rs
+@@ -27,6 +27,18 @@ pub(crate) fn select_handlers(
+     event_name: HookEventName,
+     matcher_input: Option<&str>,
+ ) -> Vec<ConfiguredHandler> {
++    let matcher_inputs = matcher_input.into_iter().collect::<Vec<_>>();
++    select_handlers_for_matcher_inputs(handlers, event_name, &matcher_inputs)
++}
++
++pub(crate) fn select_handlers_for_matcher_inputs(
++    handlers: &[ConfiguredHandler],
++    event_name: HookEventName,
++    matcher_inputs: &[&str],
++) -> Vec<ConfiguredHandler> {
++    // Check each configured handler once, even when several compatibility names
++    // match the same regex. A hook like `apply_patch|Write|Edit` should run a
++    // single time for one tool call, not once per matching alias.
+     handlers
+         .iter()
+         .filter(|handler| handler.event_name == event_name)
+@@ -35,7 +47,13 @@ pub(crate) fn select_handlers(
+             | HookEventName::PermissionRequest
+             | HookEventName::PostToolUse
+             | HookEventName::SessionStart => {
+-                matches_matcher(handler.matcher.as_deref(), matcher_input)
++                if matcher_inputs.is_empty() {
++                    matches_matcher(handler.matcher.as_deref(), /*input*/ None)
++                } else {
++                    matcher_inputs
++                        .iter()
++                        .any(|input| matches_matcher(handler.matcher.as_deref(), Some(input)))
++                }
+             }
+             HookEventName::UserPromptSubmit | HookEventName::Stop => true,
+         })
+@@ -128,6 +146,7 @@ mod tests {
+ 
+     use super::ConfiguredHandler;
+     use super::select_handlers;
++    use super::select_handlers_for_matcher_inputs;
+ 
+     fn make_handler(
+         event_name: HookEventName,
+@@ -282,6 +301,51 @@ mod tests {
+         assert_eq!(selected_bash.len(), 0);
+     }
+ 
++    #[test]
++    fn pre_tool_use_aliases_match_once_per_handler() {
++        let handlers = vec![
++            make_handler(
++                HookEventName::PreToolUse,
++                Some("^apply_patch$"),
++                "echo apply_patch",
++                /*display_order*/ 0,
++            ),
++            make_handler(
++                HookEventName::PreToolUse,
++                Some("^Write$"),
++                "echo write",
++                /*display_order*/ 1,
++            ),
++            make_handler(
++                HookEventName::PreToolUse,
++                Some("^Edit$"),
++                "echo edit",
++                /*display_order*/ 2,
++            ),
++            make_handler(
++                HookEventName::PreToolUse,
++                Some("apply_patch|Write|Edit"),
++                "echo combined",
++                /*display_order*/ 3,
++            ),
++        ];
++
++        let selected = select_handlers_for_matcher_inputs(
++            &handlers,
++            HookEventName::PreToolUse,
++            &["apply_patch", "Write", "Edit"],
++        );
++
++        assert_eq!(selected.len(), 4);
++        assert_eq!(
++            selected
++                .iter()
++                .map(|handler| handler.display_order)
++                .collect::<Vec<_>>(),
++            vec![0, 1, 2, 3],
++        );
++    }
++
+     #[test]
+     fn user_prompt_submit_ignores_matcher() {
+         let handlers = vec![
+diff --git a/codex-rs/hooks/src/events/common.rs b/codex-rs/hooks/src/events/common.rs
+index 2b721aec8fc2..e74c2912dd48 100644
+--- a/codex-rs/hooks/src/events/common.rs
++++ b/codex-rs/hooks/src/events/common.rs
+@@ -129,6 +129,17 @@ pub(crate) fn matches_matcher(matcher: Option<&str>, input: Option<&str>) -> boo
+     }
+ }
+ 
++pub(crate) fn matcher_inputs<'a>(
++    tool_name: &'a str,
++    matcher_aliases: &'a [String],
++) -> Vec<&'a str> {
++    // Keep the canonical name first so matcher previews and execution preserve
++    // the same primary identity that hook stdin will serialize.
++    std::iter::once(tool_name)
++        .chain(matcher_aliases.iter().map(String::as_str))
++        .collect()
++}
++
+ fn is_match_all_matcher(matcher: &str) -> bool {
+     matcher.is_empty() || matcher == "*"
+ }
+diff --git a/codex-rs/hooks/src/events/permission_request.rs b/codex-rs/hooks/src/events/permission_request.rs
+index c6b58b86f127..59b8f61d22da 100644
+--- a/codex-rs/hooks/src/events/permission_request.rs
++++ b/codex-rs/hooks/src/events/permission_request.rs
+@@ -40,6 +40,7 @@ pub struct PermissionRequestRequest {
+     pub model: String,
+     pub permission_mode: String,
+     pub tool_name: String,
++    pub matcher_aliases: Vec<String>,
+     pub run_id_suffix: String,
+     pub command: String,
+     pub description: Option<String>,
+@@ -66,10 +67,11 @@ pub(crate) fn preview(
+     handlers: &[ConfiguredHandler],
+     request: &PermissionRequestRequest,
+ ) -> Vec<HookRunSummary> {
+-    dispatcher::select_handlers(
++    let matcher_inputs = common::matcher_inputs(&request.tool_name, &request.matcher_aliases);
++    dispatcher::select_handlers_for_matcher_inputs(
+         handlers,
+         HookEventName::PermissionRequest,
+-        Some(&request.tool_name),
++        &matcher_inputs,
+     )
+     .into_iter()
+     .map(|handler| {
+@@ -86,10 +88,11 @@ pub(crate) async fn run(
+     shell: &CommandShell,
+     request: PermissionRequestRequest,
+ ) -> PermissionRequestOutcome {
+-    let matched = dispatcher::select_handlers(
++    let matcher_inputs = common::matcher_inputs(&request.tool_name, &request.matcher_aliases);
++    let matched = dispatcher::select_handlers_for_matcher_inputs(
+         handlers,
+         HookEventName::PermissionRequest,
+-        Some(&request.tool_name),
++        &matcher_inputs,
+     );
+     if matched.is_empty() {
+         return PermissionRequestOutcome {
+diff --git a/codex-rs/hooks/src/events/post_tool_use.rs b/codex-rs/hooks/src/events/post_tool_use.rs
+index f7f40d279475..294b08628e21 100644
+--- a/codex-rs/hooks/src/events/post_tool_use.rs
++++ b/codex-rs/hooks/src/events/post_tool_use.rs
+@@ -28,6 +28,7 @@ pub struct PostToolUseRequest {
+     pub model: String,
+     pub permission_mode: String,
+     pub tool_name: String,
++    pub matcher_aliases: Vec<String>,
+     pub tool_use_id: String,
+     pub command: String,
+     pub tool_response: Value,
+@@ -54,10 +55,11 @@ pub(crate) fn preview(
+     handlers: &[ConfiguredHandler],
+     request: &PostToolUseRequest,
+ ) -> Vec<HookRunSummary> {
+-    dispatcher::select_handlers(
++    let matcher_inputs = common::matcher_inputs(&request.tool_name, &request.matcher_aliases);
++    dispatcher::select_handlers_for_matcher_inputs(
+         handlers,
+         HookEventName::PostToolUse,
+-        Some(&request.tool_name),
++        &matcher_inputs,
+     )
+     .into_iter()
+     .map(|handler| {
+@@ -71,10 +73,11 @@ pub(crate) async fn run(
+     shell: &CommandShell,
+     request: PostToolUseRequest,
+ ) -> PostToolUseOutcome {
+-    let matched = dispatcher::select_handlers(
++    let matcher_inputs = common::matcher_inputs(&request.tool_name, &request.matcher_aliases);
++    let matched = dispatcher::select_handlers_for_matcher_inputs(
+         handlers,
+         HookEventName::PostToolUse,
+-        Some(&request.tool_name),
++        &matcher_inputs,
+     );
+     if matched.is_empty() {
+         return PostToolUseOutcome {
+@@ -86,21 +89,7 @@ pub(crate) async fn run(
+         };
+     }
+ 
+-    let input_json = match serde_json::to_string(&PostToolUseCommandInput {
+-        session_id: request.session_id.to_string(),
+-        turn_id: request.turn_id.clone(),
+-        transcript_path: crate::schema::NullableString::from_path(request.transcript_path.clone()),
+-        cwd: request.cwd.display().to_string(),
+-        hook_event_name: "PostToolUse".to_string(),
+-        model: request.model.clone(),
+-        permission_mode: request.permission_mode.clone(),
+-        tool_name: "Bash".to_string(),
+-        tool_input: PostToolUseToolInput {
+-            command: request.command.clone(),
+-        },
+-        tool_response: request.tool_response.clone(),
+-        tool_use_id: request.tool_use_id.clone(),
+-    }) {
++    let input_json = match command_input_json(&request) {
+         Ok(input_json) => input_json,
+         Err(error) => {
+             let hook_events = common::serialization_failure_hook_events_for_tool_use(
+@@ -153,6 +142,29 @@ pub(crate) async fn run(
+     }
+ }
+ 
++/// Serializes command stdin for a selected `PostToolUse` hook.
++///
++/// Handler selection may include internal matcher aliases, but hook stdin keeps
++/// the canonical `tool_name` for logs and for consumers that pair pre/post
++/// events across processes.
++fn command_input_json(request: &PostToolUseRequest) -> Result<String, serde_json::Error> {
++    serde_json::to_string(&PostToolUseCommandInput {
++        session_id: request.session_id.to_string(),
++        turn_id: request.turn_id.clone(),
++        transcript_path: crate::schema::NullableString::from_path(request.transcript_path.clone()),
++        cwd: request.cwd.display().to_string(),
++        hook_event_name: "PostToolUse".to_string(),
++        model: request.model.clone(),
++        permission_mode: request.permission_mode.clone(),
++        tool_name: request.tool_name.clone(),
++        tool_input: PostToolUseToolInput {
++            command: request.command.clone(),
++        },
++        tool_response: request.tool_response.clone(),
++        tool_use_id: request.tool_use_id.clone(),
++    })
++}
++
+ fn parse_completed(
+     handler: &ConfiguredHandler,
+     run_result: CommandRunResult,
+@@ -314,12 +326,25 @@ mod tests {
+     use serde_json::json;
+ 
+     use super::PostToolUseHandlerData;
++    use super::command_input_json;
+     use super::parse_completed;
+     use super::preview;
+     use crate::engine::ConfiguredHandler;
+     use crate::engine::command_runner::CommandRunResult;
+     use crate::events::common;
+ 
++    #[test]
++    fn command_input_uses_request_tool_name() {
++        let mut request = request_for_tool_use("call-apply-patch");
++        request.tool_name = "apply_patch".to_string();
++
++        let input_json = command_input_json(&request).expect("serialize command input");
++        let input: serde_json::Value =
++            serde_json::from_str(&input_json).expect("parse command input");
++
++        assert_eq!(input["tool_name"], "apply_patch");
++    }
++
+     #[test]
+     fn block_decision_stops_normal_processing() {
+         let parsed = parse_completed(
+@@ -551,6 +576,7 @@ mod tests {
+             model: "gpt-test".to_string(),
+             permission_mode: "default".to_string(),
+             tool_name: "Bash".to_string(),
++            matcher_aliases: Vec::new(),
+             tool_use_id: tool_use_id.to_string(),
+             command: "echo hello".to_string(),
+             tool_response: json!({"ok": true}),
+diff --git a/codex-rs/hooks/src/events/pre_tool_use.rs b/codex-rs/hooks/src/events/pre_tool_use.rs
+index f90abc2816e0..ba4ebe167e43 100644
+--- a/codex-rs/hooks/src/events/pre_tool_use.rs
++++ b/codex-rs/hooks/src/events/pre_tool_use.rs
+@@ -26,6 +26,7 @@ pub struct PreToolUseRequest {
+     pub model: String,
+     pub permission_mode: String,
+     pub tool_name: String,
++    pub matcher_aliases: Vec<String>,
+     pub tool_use_id: String,
+     pub command: String,
+ }
+@@ -47,10 +48,11 @@ pub(crate) fn preview(
+     handlers: &[ConfiguredHandler],
+     request: &PreToolUseRequest,
+ ) -> Vec<HookRunSummary> {
+-    dispatcher::select_handlers(
++    let matcher_inputs = common::matcher_inputs(&request.tool_name, &request.matcher_aliases);
++    dispatcher::select_handlers_for_matcher_inputs(
+         handlers,
+         HookEventName::PreToolUse,
+-        Some(&request.tool_name),
++        &matcher_inputs,
+     )
+     .into_iter()
+     .map(|handler| {
+@@ -64,10 +66,11 @@ pub(crate) async fn run(
+     shell: &CommandShell,
+     request: PreToolUseRequest,
+ ) -> PreToolUseOutcome {
+-    let matched = dispatcher::select_handlers(
++    let matcher_inputs = common::matcher_inputs(&request.tool_name, &request.matcher_aliases);
++    let matched = dispatcher::select_handlers_for_matcher_inputs(
+         handlers,
+         HookEventName::PreToolUse,
+-        Some(&request.tool_name),
++        &matcher_inputs,
+     );
+     if matched.is_empty() {
+         return PreToolUseOutcome {
+@@ -77,20 +80,7 @@ pub(crate) async fn run(
+         };
+     }
+ 
+-    let input_json = match serde_json::to_string(&PreToolUseCommandInput {
+-        session_id: request.session_id.to_string(),
+-        turn_id: request.turn_id.clone(),
+-        transcript_path: crate::schema::NullableString::from_path(request.transcript_path.clone()),
+-        cwd: request.cwd.display().to_string(),
+-        hook_event_name: "PreToolUse".to_string(),
+-        model: request.model.clone(),
+-        permission_mode: request.permission_mode.clone(),
+-        tool_name: "Bash".to_string(),
+-        tool_input: crate::schema::PreToolUseToolInput {
+-            command: request.command.clone(),
+-        },
+-        tool_use_id: request.tool_use_id.clone(),
+-    }) {
++    let input_json = match command_input_json(&request) {
+         Ok(input_json) => input_json,
+         Err(error) => {
+             let hook_events = common::serialization_failure_hook_events_for_tool_use(
+@@ -130,6 +120,28 @@ pub(crate) async fn run(
+     }
+ }
+ 
++/// Serializes command stdin for a selected `PreToolUse` hook.
++///
++/// Handler selection may include internal matcher aliases, but hook stdin keeps
++/// the canonical `tool_name` so audit logs and downstream policy decisions stay
++/// stable.
++fn command_input_json(request: &PreToolUseRequest) -> Result<String, serde_json::Error> {
++    serde_json::to_string(&PreToolUseCommandInput {
++        session_id: request.session_id.to_string(),
++        turn_id: request.turn_id.clone(),
++        transcript_path: crate::schema::NullableString::from_path(request.transcript_path.clone()),
++        cwd: request.cwd.display().to_string(),
++        hook_event_name: "PreToolUse".to_string(),
++        model: request.model.clone(),
++        permission_mode: request.permission_mode.clone(),
++        tool_name: request.tool_name.clone(),
++        tool_input: crate::schema::PreToolUseToolInput {
++            command: request.command.clone(),
++        },
++        tool_use_id: request.tool_use_id.clone(),
++    })
++}
++
+ fn parse_completed(
+     handler: &ConfiguredHandler,
+     run_result: CommandRunResult,
+@@ -250,12 +262,25 @@ mod tests {
+     use pretty_assertions::assert_eq;
+ 
+     use super::PreToolUseHandlerData;
++    use super::command_input_json;
+     use super::parse_completed;
+     use super::preview;
+     use crate::engine::ConfiguredHandler;
+     use crate::engine::command_runner::CommandRunResult;
+     use crate::events::common;
+ 
++    #[test]
++    fn command_input_uses_request_tool_name() {
++        let mut request = request_for_tool_use("call-apply-patch");
++        request.tool_name = "apply_patch".to_string();
++
++        let input_json = command_input_json(&request).expect("serialize command input");
++        let input: serde_json::Value =
++            serde_json::from_str(&input_json).expect("parse command input");
++
++        assert_eq!(input["tool_name"], "apply_patch");
++    }
++
+     #[test]
+     fn permission_decision_deny_blocks_processing() {
+         let parsed = parse_completed(
+@@ -540,6 +565,7 @@ mod tests {
+             model: "gpt-test".to_string(),
+             permission_mode: "default".to_string(),
+             tool_name: "Bash".to_string(),
++            matcher_aliases: Vec::new(),
+             tool_use_id: tool_use_id.to_string(),
+             command: "echo hello".to_string(),
+         }
+diff --git a/codex-rs/hooks/src/schema.rs b/codex-rs/hooks/src/schema.rs
+index d7693ac7049d..d049b09d2c17 100644
+--- a/codex-rs/hooks/src/schema.rs
++++ b/codex-rs/hooks/src/schema.rs
+@@ -231,7 +231,6 @@ pub(crate) struct PreToolUseCommandInput {
+     pub model: String,
+     #[schemars(schema_with = "permission_mode_schema")]
+     pub permission_mode: String,
+-    #[schemars(schema_with = "pre_tool_use_tool_name_schema")]
+     pub tool_name: String,
+     pub tool_input: PreToolUseToolInput,
+     pub tool_use_id: String,
+@@ -260,7 +259,6 @@ pub(crate) struct PermissionRequestCommandInput {
+     pub model: String,
+     #[schemars(schema_with = "permission_mode_schema")]
+     pub permission_mode: String,
+-    #[schemars(schema_with = "permission_request_tool_name_schema")]
+     pub tool_name: String,
+     pub tool_input: PermissionRequestToolInput,
+ }
+@@ -286,7 +284,6 @@ pub(crate) struct PostToolUseCommandInput {
+     pub model: String,
+     #[schemars(schema_with = "permission_mode_schema")]
+     pub permission_mode: String,
+-    #[schemars(schema_with = "post_tool_use_tool_name_schema")]
+     pub tool_name: String,
+     pub tool_input: PostToolUseToolInput,
+     pub tool_response: Value,
+@@ -545,10 +542,6 @@ fn post_tool_use_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema {
+     string_const_schema("PostToolUse")
+ }
+ 
+-fn post_tool_use_tool_name_schema(_gen: &mut SchemaGenerator) -> Schema {
+-    string_const_schema("Bash")
+-}
+-
+ fn pre_tool_use_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema {
+     string_const_schema("PreToolUse")
+ }
+@@ -557,14 +550,6 @@ fn permission_request_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Sche
+     string_const_schema("PermissionRequest")
+ }
+ 
+-fn pre_tool_use_tool_name_schema(_gen: &mut SchemaGenerator) -> Schema {
+-    string_const_schema("Bash")
+-}
+-
+-fn permission_request_tool_name_schema(_gen: &mut SchemaGenerator) -> Schema {
+-    string_const_schema("Bash")
+-}
+-
+ fn user_prompt_submit_hook_event_name_schema(_gen: &mut SchemaGenerator) -> Schema {
+     string_const_schema("UserPromptSubmit")
+ }
