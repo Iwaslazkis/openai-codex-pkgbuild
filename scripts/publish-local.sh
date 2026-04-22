@@ -16,7 +16,11 @@ if (( ${#packages[@]} == 0 )); then
 fi
 
 latest_package="$(printf '%s\n' "${packages[@]}" | sort -V | tail -n1)"
-cp -f "$latest_package" "$local_repo/"
+staged_package="$local_repo/.$(basename "$latest_package").tmp"
+
+cp -f "$latest_package" "$staged_package"
+bsdtar -tf "$staged_package" >/dev/null
+mv -f "$staged_package" "$local_repo/$(basename "$latest_package")"
 
 mapfile -t existing < <(find "$local_repo" -maxdepth 1 -type f -name "${package_name}-*.pkg.tar.zst" | sort)
 if (( ${#existing[@]} > 1 )); then
