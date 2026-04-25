@@ -3,10 +3,12 @@ set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"/.. && pwd)"
 package_name="openai-codex"
-local_repo="$HOME/opt/pkgbuilds"
+repoctl="$HOME/projects/pkgbuilds/personal-pkgbuilds/repoctl"
 
-mkdir -p "$local_repo"
-ln -sfn "$HOME/projects/pkgbuilds" "$local_repo/src"
+[[ -x "$repoctl" ]] || {
+  printf 'repoctl is missing or not executable: %s\n' "$repoctl" >&2
+  exit 1
+}
 
 shopt -s nullglob
 packages=("$repo_root"/${package_name}-*.pkg.tar.zst)
@@ -16,19 +18,4 @@ if (( ${#packages[@]} == 0 )); then
 fi
 
 latest_package="$(printf '%s\n' "${packages[@]}" | sort -V | tail -n1)"
-staged_package="$local_repo/.$(basename "$latest_package").tmp"
-
-cp -f "$latest_package" "$staged_package"
-bsdtar -tf "$staged_package" >/dev/null
-mv -f "$staged_package" "$local_repo/$(basename "$latest_package")"
-
-mapfile -t existing < <(find "$local_repo" -maxdepth 1 -type f -name "${package_name}-*.pkg.tar.zst" | sort)
-if (( ${#existing[@]} > 1 )); then
-  for pkg in "${existing[@]:0:${#existing[@]}-1}"; do
-    rm -f "$pkg"
-  done
-fi
-
-repo-add --remove "$local_repo/personal.db.tar.gz" "$local_repo"/${package_name}-*.pkg.tar.zst
-
-printf 'Published %s into %s\n' "$(basename "$latest_package")" "$local_repo"
+"$repoctl" add "$latest_package"
